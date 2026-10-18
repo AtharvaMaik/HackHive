@@ -185,7 +185,7 @@ def _page_css() -> None:
         .event strong { display:block; font:600 .65rem 'IBM Plex Mono'; color:var(--event); }
         .event span { font-size:.68rem; color:#88a4b3; }
         .guard-alert { display:flex; align-items:center; justify-content:space-between; gap:1rem; min-height:72px; margin:.1rem 0 .7rem; padding:.72rem 1rem; border:2px solid var(--red); background:linear-gradient(90deg,rgba(104,12,25,.97),rgba(38,8,17,.96)); box-shadow:0 0 28px rgba(255,104,120,.28),inset 0 0 28px rgba(255,104,120,.08); animation:guard-pulse 1.15s ease-in-out infinite alternate; }
-        .guard-alert strong { display:block; font:700 1.65rem/1 'Barlow Condensed'; letter-spacing:.05em; color:#fff; }
+        .guard-alert strong { display:block; font:700 1.65rem/1 'Barlow Condensed'; letter-spacing:.05em; color:var(--red); }
         .guard-alert span { display:block; margin-top:.25rem; font:500 .66rem 'IBM Plex Mono'; color:#ffc3ca; letter-spacing:.04em; }
         .guard-alert .guard-mark { flex:0 0 auto; font:700 1rem 'IBM Plex Mono'; color:#fff; border:1px solid #ff9aa5; padding:.55rem .75rem; text-align:center; }
         @keyframes guard-pulse { from { border-color:#ff6878; } to { border-color:#ffb0b8; box-shadow:0 0 42px rgba(255,104,120,.42),inset 0 0 30px rgba(255,104,120,.12); } }
@@ -498,6 +498,85 @@ def _acoustic_figure(rpm: int, load_percent: int, cursor: int) -> go.Figure:
         font=dict(family="IBM Plex Mono", size=9, color="#7e9aaa"), title=dict(text="SYNTHETIC COMBUSTION CARRIER", x=.025, font=dict(size=11, color="#d7f5ff")),
         xaxis=dict(title="milliseconds", gridcolor="#173342", zeroline=False), yaxis=dict(showticklabels=False, gridcolor="#173342", zeroline=False),
         legend=dict(orientation="h", y=1.14, x=1, xanchor="right", font=dict(size=9)),
+    )
+    return fig
+
+
+def _box_mesh(x0, x1, y0, y1, z0, z1, color, opacity=1.0) -> go.Mesh3d:
+    vertices = [
+        (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+        (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1),
+    ]
+    faces = [
+        (0, 1, 2), (0, 2, 3), (4, 6, 5), (4, 7, 6), (0, 4, 5), (0, 5, 1),
+        (1, 5, 6), (1, 6, 2), (2, 6, 7), (2, 7, 3), (3, 7, 4), (3, 4, 0),
+    ]
+    return go.Mesh3d(
+        x=[point[0] for point in vertices], y=[point[1] for point in vertices], z=[point[2] for point in vertices],
+        i=[face[0] for face in faces], j=[face[1] for face in faces], k=[face[2] for face in faces],
+        color=color, opacity=opacity, flatshading=True, hoverinfo="skip", showscale=False,
+        lighting=dict(ambient=.65, diffuse=.75, specular=.25, roughness=.65, fresnel=.08),
+    )
+
+
+def _cylinder_mesh(start, end, radius, color, *, opacity=1.0, segments=14) -> go.Mesh3d:
+    start, end = np.asarray(start, dtype=float), np.asarray(end, dtype=float)
+    axis = end - start
+    axis /= max(float(np.linalg.norm(axis)), 1e-9)
+    reference = np.array([0.0, 0.0, 1.0]) if abs(axis[2]) < .9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(axis, reference)
+    u /= max(float(np.linalg.norm(u)), 1e-9)
+    v = np.cross(axis, u)
+    ring = [np.cos(2 * np.pi * index / segments) * u + np.sin(2 * np.pi * index / segments) * v for index in range(segments)]
+    points = [start + radius * vector for vector in ring] + [end + radius * vector for vector in ring]
+    points += [start, end]
+    face_i, face_j, face_k = [], [], []
+    for index in range(segments):
+        following = (index + 1) % segments
+        face_i.extend([index, index, 2 * segments, 2 * segments + 1])
+        face_j.extend([following, segments + index, following, segments + following])
+        face_k.extend([segments + index, segments + following, index, segments + index])
+    return go.Mesh3d(
+        x=[point[0] for point in points], y=[point[1] for point in points], z=[point[2] for point in points],
+        i=face_i, j=face_j, k=face_k, color=color, opacity=opacity,
+        flatshading=True, hoverinfo="skip", showscale=False,
+        lighting=dict(ambient=.6, diffuse=.8, specular=.3, roughness=.5),
+    )
+
+
+def _engine_cutaway_figure(elapsed: float, *, stopped: bool, failed: bool) -> go.Figure:
+    """Animated conceptual inline-four cutaway, synchronized to replay time."""
+    if failed:
+        block, head, liner, piston, rod, crank = "#b72f35", "#dc4145", "#f08080", "#8f2028", "#a72a31", "#cf343b"
+        title = "<b><span style='color:#ff6878'>SIMULATED ENGINE FAILURE · POWER LOST</span></b>"
+    elif stopped:
+        block, head, liner, piston, rod, crank = "#a34b42", "#cc655d", "#d68d84", "#8f3535", "#a74740", "#cf514b"
+        title = "<b><span style='color:#ff6878'>ENGINEGUARD STOP · FAULT CONFIRMED</span></b>"
+    else:
+        block, head, liner, piston, rod, crank = "#526e7d", "#8399a4", "#b4c3c8", "#d6dde0", "#bd744b", "#17627b"
+        title = "<span style='color:#d7f5ff'>INLINE-FOUR CUTAWAY · RUNNING</span>"
+
+    fig = go.Figure()
+    fig.add_trace(_box_mesh(-2.25, 2.25, -.62, .62, .36, 2.12, block, .30))
+    fig.add_trace(_box_mesh(-2.28, 2.28, -.70, .70, 2.12, 2.42, head, .96))
+    for index, x in enumerate([-1.5, -.5, .5, 1.5]):
+        phase = 2 * np.pi * (elapsed / 12.0) + index * np.pi / 2
+        crank_z = .34 + .26 * np.cos(phase)
+        piston_z = 1.42 + .30 * np.cos(phase)
+        fig.add_trace(_cylinder_mesh((x, 0, .72), (x, 0, 1.98), .34, liner, opacity=.27))
+        fig.add_trace(_box_mesh(x - .27, x + .27, -.26, .26, piston_z - .13, piston_z + .13, piston, .98))
+        fig.add_trace(_cylinder_mesh((x, 0, piston_z - .13), (x, 0, crank_z), .075, rod))
+        fig.add_trace(_cylinder_mesh((x, 0, crank_z - .07), (x, 0, crank_z + .07), .16, crank))
+    fig.add_trace(_cylinder_mesh((-2.35, 0, .34), (2.35, 0, .34), .12, crank))
+    fig.update_layout(
+        height=290, margin=dict(l=0, r=0, t=42, b=0), paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="IBM Plex Mono", size=9, color="#7e9aaa"),
+        title=dict(text=title, x=.03, xanchor="left", font=dict(size=11)), showlegend=False,
+        scene=dict(
+            xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False),
+            aspectmode="data", camera=dict(eye=dict(x=1.55, y=1.8, z=1.1)), bgcolor="rgba(0,0,0,0)",
+        ),
+        uirevision="live-engine-cutaway",
     )
     return fig
 
@@ -839,7 +918,7 @@ def render() -> None:
             for label, value, note, color in kpis
         ) + '</div>', unsafe_allow_html=True)
 
-        main, side = st.columns([2.25, .75], gap="small")
+        main, side = st.columns([1.85, 1.15], gap="small")
         with main:
             st.plotly_chart(_timeline(simulated_frame, guard_evidence, confirmed, cursor, st.session_state.guard_enabled, failure_time, event), width="stretch", config={"displayModeBar": False})
         with side:
@@ -852,6 +931,12 @@ def render() -> None:
             )
             st.caption("Consistency heuristic; it does not estimate wear or remaining life.")
             st.progress((cursor + 1) / len(frame), text=f"Replay {100 * (cursor + 1) / len(frame):.1f}%")
+            st.markdown('<div class="panel-label">ANIMATED INLINE-FOUR CUTAWAY</div>', unsafe_allow_html=True)
+            st.plotly_chart(
+                _engine_cutaway_figure(elapsed, stopped=guard_tripped or engine_failed, failed=engine_failed),
+                width="stretch", config={"displayModeBar": False},
+            )
+            st.caption("Conceptual moving assembly; red bold status marks a confirmed stop or simulated failure.")
 
         st.markdown(_data_bus(zrow), unsafe_allow_html=True)
         lower_left, lower_right = st.columns([1.5, .9], gap="small")

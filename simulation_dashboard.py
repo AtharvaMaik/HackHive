@@ -260,15 +260,14 @@ def load_replay(_run_id: str = BASELINE_RUN_ID) -> tuple[pd.DataFrame, pd.DataFr
     peak = guard_evidence.max(axis=1)
     health = (100 - 62 * np.clip((peak - 0.5) / 1.5, 0, 1)).clip(18, 100)
 
-    # This is a genuinely healthy held-out trace. The event toggle adds faults
-    # and simulated consequences later, so the off state remains fault-free.
+    # The replay stays healthy; its measured consistency residuals still vary by window.
     return (
         frame,
         frame.copy(),
         evidence,
         guard_evidence,
         confirmed,
-        pd.Series(100.0, index=frame.index),
+        health,
         pd.Series(0.0, index=frame.index),
         float("inf"),
     )
@@ -299,25 +298,14 @@ def _create_triggered_event(frame: pd.DataFrame, scenario_id: str, consistency_m
     code = DETECTOR_BY_SENSOR[sensor]
     card = consistency_model["models"][code]
     start = min(max(0, int(start)), max(0, len(frame) - CONFIRMATION_WINDOWS))
-    row = frame.iloc[[start]][card["predictors"]]
-    expected = float(card["estimator"].predict(row)[0])
-    threshold = float(card["residual_threshold"])
-    raw = expected * (1 + max(.15, 1.6 * threshold))
-    for _ in range(8):
-        candidate = frame.copy()
-        candidate.loc[start:, f"{sensor}__mean"] = raw
-        scores = sensor_consistency_evidence(consistency_model, candidate)[code].iloc[start : start + CONFIRMATION_WINDOWS]
-        if int(scores.ge(ENGINEGUARD_THRESHOLD).sum()) >= CONFIRMATION_HITS and bool(scores.ge(CONFIRMATION_PEAK).any()):
-            return {
-                "scenario_id": scenario_id,
-                "sensor": sensor,
-                "code": code,
-                "value_raw": raw,
-                "start": start,
-                "onset": float(frame["window_end_s"].iloc[start]),
-            }
-        raw = expected * (1 + (1.6 + 0.5 * (_ + 1)) * threshold)
-    raise ValueError(f"Could not create a confirmable {scenario['name']} event at this replay position.")
+    return {
+        "scenario_id": scenario_id,
+        "sensor": sensor,
+        "code": code,
+        "relative_bias": max(.15, 1.6 * float(card["residual_threshold"])),
+        "start": start,
+        "onset": float(frame["window_end_s"].iloc[start]),
+    }
 
 
 def _manual_relative_changes(biases: dict[str, float]) -> tuple[str | None, dict[str, float]]:
@@ -394,7 +382,9 @@ def _apply_triggered_event(
         source = _manual_candidate(frame, start, event["relative_changes"])
     else:
         source = frame.copy()
-        source.loc[start:, column] = float(event["value_raw"])
+        card = consistency_model["models"][event["code"]]
+        expected = card["estimator"].predict(frame.loc[start:, card["predictors"]])
+        source.loc[start:, column] = expected * (1 + float(event["relative_bias"]))
     all_scores = sensor_consistency_evidence(consistency_model, source)
     if is_manual:
         scores = all_scores.copy()
@@ -483,9 +473,10 @@ def _timeline(frame: pd.DataFrame, guard_evidence: pd.DataFrame, confirmed: pd.D
             fig.add_vline(x=event_at, line_color="#f7bd66", line_dash="dash", annotation_text=label, annotation_position="top left", annotation_font_color="#f7bd66", row=1, col=1)
     if len(x) and x.min() <= failure_time <= x.max():
         fig.add_vline(x=failure_time, line_color="#ff6878", line_dash="dot", annotation_text="SIMULATED FAILURE", annotation_position="top right", annotation_font_color="#ff6878", row=1, col=1)
+    title = "MEASURED HEALTHY REPLAY · LIVE SENSOR CONSISTENCY" if triggered_event is None else "MEASURED BASELINE · INJECTED FAULT + SIMULATED RESPONSE"
     fig.update_layout(
         height=324, margin=dict(l=18, r=12, t=42, b=20), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#081923",
-        font=dict(family="IBM Plex Mono", size=10, color="#7e9aaa"), title=dict(text="HEALTHY REPLAY · TRIGGERED EVENT + SIMULATED RESPONSE", x=.018, font=dict(size=12, color="#d7f5ff")),
+        font=dict(family="IBM Plex Mono", size=10, color="#7e9aaa"), title=dict(text=title, x=.018, font=dict(size=12, color="#d7f5ff")),
         legend=dict(orientation="h", y=1.09, x=.98, xanchor="right", font=dict(size=9)), hovermode="x unified",
     )
     fig.update_xaxes(gridcolor="#173342", zeroline=False, title_text="dataset time · seconds", row=2, col=1)
@@ -600,7 +591,7 @@ def render() -> None:
         st.session_state.sim_cursor = 0
         st.session_state.sim_running = True
 
-    frame, _, base_evidence, base_scores, _, _, _, _ = load_replay()
+    frame, _, base_evidence, base_scores, _, base_health, _, _ = load_replay()
     active_model, consistency_model = load_guard_bundle()
 
     st.markdown(
@@ -658,7 +649,7 @@ def render() -> None:
     if st.session_state.triggered_failure and st.session_state.manual_event is not None:
         st.session_state.manual_event = None
     manual_event_active = st.session_state.manual_event is not None
-    with st.expander("MANUAL SENSOR FAULT · RELATIVE BIAS CONTROLS", expanded=True):
+    with st.expander("INJECT A SENSOR FAULT", expanded=False):
         st.caption("Set a relative bias for any stream. Injection adds a small, fixed companion signature and arms only when that sensor's own guard model meets the two-of-three rule.")
         slider_columns = st.columns(2, gap="large")
         manual_biases: dict[str, float] = {}
@@ -760,9 +751,9 @@ def render() -> None:
     else:
         simulated_frame = frame.copy()
         evidence = base_evidence.copy()
-        guard_evidence = pd.DataFrame(0.0, index=frame.index, columns=base_scores.columns)
+        guard_evidence = base_scores.copy()
         confirmed = pd.DataFrame(False, index=frame.index, columns=base_scores.columns)
-        health = pd.Series(100.0, index=frame.index)
+        health = base_health.copy()
         degradation = pd.Series(0.0, index=frame.index)
         failure_time = float("inf")
     if event is None:
@@ -854,25 +845,25 @@ def render() -> None:
         with side:
             ring_color = "#ff6878" if health_score < 50 else "#f7bd66" if health_score < 72 else "#64f2c8"
             st.markdown(
-                f'<div class="panel"><div class="panel-label">Calculated engine state</div><div class="engine-core">'
+                f'<div class="panel"><div class="panel-label">Health index · model consistency</div><div class="engine-core">'
                 f'<div><div class="health-ring" style="--score:{health_score:.0f};--ring:{ring_color}"><div class="health-copy"><strong>{health_score:.0f}</strong><span>health index</span></div></div>'
                 f'<div class="state-line" style="--state:{state_color}">● {state}</div></div></div></div>',
                 unsafe_allow_html=True,
             )
+            st.caption("Consistency heuristic; it does not estimate wear or remaining life.")
             st.progress((cursor + 1) / len(frame), text=f"Replay {100 * (cursor + 1) / len(frame):.1f}%")
 
         st.markdown(_data_bus(zrow), unsafe_allow_html=True)
-        lower_left, lower_right = st.columns([2.25, .75], gap="small")
+        lower_left, lower_right = st.columns([1.5, .9], gap="small")
         with lower_left:
             st.markdown('<div class="panel-label">LIVE SENSOR ARRAY · MAX STANDARDIZED MODEL EVIDENCE ACROSS MEAN / STD / RANGE / SLOPE</div>', unsafe_allow_html=True)
             st.markdown(_sensor_cards(display_row, zrow, score_row, confirmed_row), unsafe_allow_html=True)
         with lower_right:
-            tabs = st.tabs(["EVENTS", "COMBUSTION"])
-            with tabs[0]:
-                st.markdown(_events(elapsed, onset, active, decision_score, detected_code, scenario, st.session_state.guard_enabled, guard_tripped, float(degradation.iloc[cursor]), engine_failed), unsafe_allow_html=True)
-            with tabs[1]:
-                st.plotly_chart(_acoustic_figure(measured_rpm, load_percent, cursor), width="stretch", config={"displayModeBar": False})
-                st.caption("Synthetic microphone and accelerometer carrier driven by the measured RPM/load. Fault evidence comes from the LiU-ICE sensors above.")
+            st.markdown('<div class="panel-label">LIVE EVENTS</div>', unsafe_allow_html=True)
+            st.markdown(_events(elapsed, onset, active, decision_score, detected_code, scenario, st.session_state.guard_enabled, guard_tripped, float(degradation.iloc[cursor]), engine_failed), unsafe_allow_html=True)
+            st.markdown('<div class="panel-label">SYNTHETIC COMBUSTION SIGNAL</div>', unsafe_allow_html=True)
+            st.plotly_chart(_acoustic_figure(measured_rpm, load_percent, cursor), width="stretch", config={"displayModeBar": False})
+            st.caption("Carrier follows measured RPM and load; fault evidence comes from the LiU-ICE sensors.")
 
         if st.session_state.sim_running:
             st.session_state.sim_cursor = 0 if cursor >= len(frame) - 1 else cursor + 1
